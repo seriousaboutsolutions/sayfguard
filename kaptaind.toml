@@ -1,0 +1,51 @@
+# Kaptaind configuration for sayfguard
+[project]
+name = "sayfguard"
+path = "."
+language = "rust"
+
+[project.owners]
+primary = "info@seriousaboutsolutions.co.uk"
+
+[project.release]
+version_file = "VERSION"
+semver_format = "{major}.{minor}.{patch}"
+auto_tag = false
+auto_release = false
+
+[project.git]
+remote = "git@github.com:seriousaboutsolutions/sayfguard.git"
+branch = "main"
+
+[push]
+enabled = true
+dry_run = false
+
+[push.safety]
+allow_force = false
+require_upstream_exist = true
+protect_branches = []
+
+[project.analysis]
+watch = ["crates/", "Cargo.toml", "docs/"]
+ignore = ["target/", ".kaptaind/"]
+
+[project.hooks]
+pre_commit = ["cargo build --workspace"]
+
+# "untrusted" is the right default for a repository-supplied config nobody
+# has reviewed yet (ADR-010's convention in combine-harvester) -- but it
+# refuses to start at all once any hook is configured, rather than skipping
+# it silently. This config was authored and reviewed as part of setting up
+# this project, not consumed unreviewed, so trusted execution of its one
+# hook (a plain `cargo build`) is the correct posture here.
+[trust]
+execution = "trusted"
+
+[project.ai]
+model = "none"
+api_key_variables = []
+
+[project.budget]
+max_tokens_per_commit = 0
+max_tokens_per_release = 0

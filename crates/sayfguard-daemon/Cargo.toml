@@ -1,0 +1,8 @@
+[package]
+name = "sayfguard-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Evidence-preservation daemon: lease-gated sequestration and time-boxed retention for data directories that must never be silently overwritten."
+
+[dependencies]
