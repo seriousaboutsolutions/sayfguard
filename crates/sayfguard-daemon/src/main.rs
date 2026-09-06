@@ -1,10 +1,12 @@
 //! Sayfguard: lease-gated evidence sequestration and time-boxed retention.
 //!
 //! Phase 1 (see the technical directive's deployment-phasing table): lease
-//! and sequester modules, driven manually from this CLI. There is no
-//! resident daemon process yet -- `watcher.rs`, `retention.rs`, and
-//! `notify.rs` remain scaffolds pending Phases 2 and 3. The architecture,
-//! retention policy, and GDPR posture are specified in
+//! and sequester modules, driven manually from this CLI. Phase 2 adds
+//! `watcher.rs` (lease-less-mutation alerting) and the full-fidelity ->
+//! degraded transition in `retention.rs`, both reachable below via `watch`,
+//! `sweep`, and `complete`. `notify.rs` (Phase 3: scheduled 7-day
+//! notifications, degraded -> attested) remains a scaffold. The
+//! architecture, retention policy, and GDPR posture are specified in
 //! `docs/SAYFGUARD_TECHNICAL_DIRECTIVE.md` and `docs/ADR/`.
 
 mod lease;
@@ -15,16 +17,18 @@ mod watcher;
 
 use clap::{Parser, Subcommand};
 use lease::LeaseStore;
+use retention::DEFAULT_FULL_FIDELITY_WINDOW_SECS;
 use sequester::SequesterConfig;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
+use watcher::WatchedPath;
 
 #[derive(Parser)]
 #[command(
     name = "sayfguard",
     version,
-    about = "Lease-gated evidence sequestration (Phase 1: manual CLI-driven lease acquisition)"
+    about = "Lease-gated evidence sequestration, lease-less-mutation alerting, and tiered retention"
 )]
 struct Cli {
     /// Directory holding Sayfguard's lease state (leases.json).
@@ -76,6 +80,53 @@ enum Command {
     },
     /// List currently active (unexpired) leases.
     Status,
+    /// Watch guarded paths, alerting on any mutation with no active lease
+    /// (ADR-001's bypass-detection mechanism), and run a retention sweep
+    /// whenever nothing has fired for `--sweep-interval-seconds`. Blocks
+    /// until interrupted.
+    Watch {
+        /// A guarded path and the resource name its lease is filed under,
+        /// as `resource=path`. Repeatable.
+        #[arg(long = "guard", value_parser = parse_watched_path, required = true)]
+        guards: Vec<WatchedPath>,
+        #[arg(long)]
+        sequester_root: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_FULL_FIDELITY_WINDOW_SECS)]
+        window_seconds: u64,
+        #[arg(long, default_value_t = 60)]
+        sweep_interval_seconds: u64,
+    },
+    /// Run a retention sweep now: degrades any full-fidelity artifact under
+    /// `--sequester-root` that has hit the window or been marked complete
+    /// (ADR-002's stage 1 -> stage 2 transition).
+    Sweep {
+        #[arg(long)]
+        sequester_root: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_FULL_FIDELITY_WINDOW_SECS)]
+        window_seconds: u64,
+    },
+    /// Mark every sequestered artifact for a resource as task-complete, so
+    /// the next sweep degrades them regardless of age (ADR-002:
+    /// `min(90 days, task completion)`).
+    Complete {
+        #[arg(long)]
+        resource: String,
+        #[arg(long)]
+        sequester_root: PathBuf,
+    },
+}
+
+fn parse_watched_path(raw: &str) -> Result<WatchedPath, String> {
+    let (resource, path) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("expected resource=path, got '{raw}'"))?;
+    if resource.is_empty() || path.is_empty() {
+        return Err(format!("expected resource=path, got '{raw}'"));
+    }
+    Ok(WatchedPath {
+        resource: resource.to_string(),
+        path: PathBuf::from(path),
+    })
 }
 
 fn main() -> ExitCode {
@@ -127,6 +178,45 @@ fn main() -> ExitCode {
         Command::Status => store
             .active_leases()
             .map(|leases| print_json(&leases))
+            .map_err(|error| error.to_string()),
+        Command::Watch {
+            guards,
+            sequester_root,
+            window_seconds,
+            sweep_interval_seconds,
+        } => watcher::run(
+            &guards,
+            &store,
+            &sequester_root,
+            window_seconds,
+            Duration::from_secs(sweep_interval_seconds),
+            |alert| {
+                eprintln!(
+                    "sayfguard: INTEGRITY ALERT: resource '{}' at {} mutated with no active lease (detected at unix time {})",
+                    alert.resource,
+                    alert.path.display(),
+                    alert.detected_at
+                );
+            },
+            |outcomes| {
+                let degraded: Vec<_> = outcomes.iter().filter(|o| o.transitioned).collect();
+                if !degraded.is_empty() {
+                    eprintln!("sayfguard: retention sweep degraded {} artifact(s)", degraded.len());
+                }
+            },
+        )
+        .map_err(|error| error.to_string()),
+        Command::Sweep {
+            sequester_root,
+            window_seconds,
+        } => retention::sweep(&sequester_root, window_seconds)
+            .map(|outcomes| print_json(&outcomes))
+            .map_err(|error| error.to_string()),
+        Command::Complete {
+            resource,
+            sequester_root,
+        } => retention::mark_task_complete(&sequester_root, &resource)
+            .map(|updated| println!("marked {updated} artifact(s) task-complete for '{resource}'"))
             .map_err(|error| error.to_string()),
     };
 

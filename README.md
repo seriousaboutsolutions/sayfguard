@@ -16,17 +16,28 @@ Read the full specification before implementing anything:
 
 ## Status
 
-Phase 1 of the deployment-phasing table (technical directive) is
-implemented: `lease.rs` and `sequester.rs` are real, tested, and wired into
-a CLI (`sayfguard acquire|release|status`). Acquiring a lease synchronously
-sequesters the guarded resource by invoking an external backup engine (e.g.
-Combine Harvester's `scripts/harvester-backup.py`) before the lease is
-granted, per ADR-001; leases persist to a JSON file under `--state-dir` and
-are CLI-driven only — there is no resident daemon process yet.
+Phases 1 and 2 of the deployment-phasing table (technical directive) are
+implemented.
 
-`watcher.rs`, `retention.rs`, and `notify.rs` remain scaffolds (Phases 2-3):
-no lease-less-mutation alerting, no automatic retention-stage transitions,
-no scheduled 7-day warnings yet. See each module's doc comment.
+**Phase 1** — `lease.rs` and `sequester.rs` are real, tested, and wired into
+a CLI. Acquiring a lease synchronously sequesters the guarded resource by
+invoking an external backup engine (e.g. Combine Harvester's
+`scripts/harvester-backup.py`) before the lease is granted, per ADR-001;
+leases persist to a JSON file under `--state-dir`.
+
+**Phase 2** — `watcher.rs` watches guarded paths for real (via the `notify`
+crate) and raises an integrity alert whenever a mutation occurs with no
+active lease on record for that resource (ADR-001's bypass-detection
+mechanism). `retention.rs` implements ADR-002's stage 1 -> stage 2
+transition: `sayfguard sweep` degrades any full-fidelity artifact that has
+hit the retention window or been marked complete via `sayfguard complete`,
+deleting the encrypted archive bytes while keeping the manifest.
+
+There is still no resident daemon process managing all of this together —
+`watch` is one long-running CLI invocation an operator or supervisor (e.g. a
+systemd service) starts explicitly. `notify.rs` (Phase 3: scheduled 7-day
+warnings, degraded -> attested transition, hash-chained audit trail) remains
+a scaffold.
 
 ```
 cargo run -p sayfguard-daemon -- \
@@ -36,6 +47,15 @@ cargo run -p sayfguard-daemon -- \
   --registry /path/to/registry.db --objects /path/to/objects \
   --sequester-root ./sequestered --passphrase-file ./passphrase.txt \
   --backup-script /path/to/harvester-backup.py
+
+# In a separate, long-running process:
+cargo run -p sayfguard-daemon -- \
+  --state-dir ./sayfguard-state \
+  watch --guard case-AC/registry=/path/to/registry.db \
+  --sequester-root ./sequestered
+
+# Periodically (e.g. from cron or a systemd timer):
+cargo run -p sayfguard-daemon -- sweep --sequester-root ./sequestered
 ```
 
 ## Origin

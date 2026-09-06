@@ -23,6 +23,7 @@
 //! archive file to `--output`; nothing here is Combine-Harvester-specific
 //! beyond that CLI shape.
 
+use crate::retention::RetentionStage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -46,8 +47,10 @@ pub struct SequesterConfig {
     /// Directory sequestered archives and manifests are written into.
     pub sequester_root: PathBuf,
     pub passphrase_file: PathBuf,
-    /// The guarded resource's name, used only to make archive filenames
-    /// legible; not interpreted otherwise.
+    /// The guarded resource's name. Used to make archive filenames legible
+    /// *and* to group an artifact with its lease and with sibling artifacts
+    /// for the same resource -- `retention::mark_task_complete` and the
+    /// watcher's lease-less-mutation check both key off this field.
     pub resource: String,
 }
 
@@ -59,13 +62,23 @@ pub struct SequesteredArtifact {
     /// without ever decrypting it.
     pub sha256: String,
     pub sequestered_at: u64,
+    pub resource: String,
     pub source_path: PathBuf,
     pub archive_path: PathBuf,
     pub manifest_path: PathBuf,
     /// Set when the owning case/task is marked complete; see ADR-002.
-    /// Always `false` at sequestration time -- only `retention.rs` (Phase 2)
-    /// updates it.
+    /// Always `false` at sequestration time -- `retention::mark_task_complete`
+    /// (Phase 2) is what updates it.
     pub task_complete: bool,
+    /// Where this artifact sits in ADR-002's three-stage lifecycle. Always
+    /// `FullFidelity` at sequestration time -- `retention::sweep` (Phase 2)
+    /// is what advances it.
+    #[serde(default)]
+    pub stage: RetentionStage,
+    /// Set by `retention::sweep` when this artifact transitions to
+    /// `RetentionStage::Degraded`; `None` while still full-fidelity.
+    #[serde(default)]
+    pub degraded_at: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,10 +142,13 @@ pub fn sequester(config: &SequesterConfig) -> Result<SequesteredArtifact, Seques
     let artifact = SequesteredArtifact {
         sha256,
         sequestered_at: now,
+        resource: config.resource.clone(),
         source_path: config.registry_path.clone(),
         archive_path: archive_path.clone(),
         manifest_path: manifest_path.clone(),
         task_complete: false,
+        stage: RetentionStage::default(),
+        degraded_at: None,
     };
     fs::write(&manifest_path, serde_json::to_string_pretty(&artifact)?)?;
     Ok(artifact)
