@@ -199,13 +199,13 @@ Before Sayfguard can protect Combine Harvester specifically:
 
 ## Deployment phasing
 
-| Phase | Scope | Depends on |
-|---|---|---|
-| 0 | This directive + ADRs + Rust workspace scaffold (this commit) | — |
-| 1 | Lease + sequester modules; invoke `harvester-backup.py` as the encryption engine; manual lease acquisition via CLI | ADR-001 |
-| 2 | Watcher + lease-less-mutation alerting; retention stage transitions (full-fidelity → degraded) | Phase 1 |
-| 3 | Notification scheduling (7-day cadence); degraded → attested transition; hash-chained audit trail | Phase 2 |
-| 4 | Combine Harvester integration: data-directory separation (prerequisite 1 above, can and should happen independently of Sayfguard's own timeline), lease wiring, completion signal, erasure cascade | Phases 1-3 + prerequisite 1 |
+| Phase | Scope | Depends on | Status |
+|---|---|---|---|
+| 0 | This directive + ADRs + Rust workspace scaffold | — | Done |
+| 1 | Lease + sequester modules; invoke `harvester-backup.py` as the encryption engine; manual lease acquisition via CLI | ADR-001 | Done — `lease.rs`, `sequester.rs`, `sayfguard acquire\|release\|status` |
+| 2 | Watcher + lease-less-mutation alerting; retention stage transitions (full-fidelity → degraded) | Phase 1 | Not started |
+| 3 | Notification scheduling (7-day cadence); degraded → attested transition; hash-chained audit trail | Phase 2 | Not started |
+| 4 | Combine Harvester integration: data-directory separation (prerequisite 1 above, can and should happen independently of Sayfguard's own timeline), lease wiring, completion signal, erasure cascade | Phases 1-3 + prerequisite 1 | Not started |
 
 Phase 4's Combine-Harvester-specific integration work is deliberately
 listed last in Sayfguard's own build order but should be scheduled in

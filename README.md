@@ -16,9 +16,27 @@ Read the full specification before implementing anything:
 
 ## Status
 
-Scaffold only. `crates/sayfguard-daemon` compiles but has no runtime
-behavior yet — see the module doc comments for what each one will own and
-which ADR governs it.
+Phase 1 of the deployment-phasing table (technical directive) is
+implemented: `lease.rs` and `sequester.rs` are real, tested, and wired into
+a CLI (`sayfguard acquire|release|status`). Acquiring a lease synchronously
+sequesters the guarded resource by invoking an external backup engine (e.g.
+Combine Harvester's `scripts/harvester-backup.py`) before the lease is
+granted, per ADR-001; leases persist to a JSON file under `--state-dir` and
+are CLI-driven only — there is no resident daemon process yet.
+
+`watcher.rs`, `retention.rs`, and `notify.rs` remain scaffolds (Phases 2-3):
+no lease-less-mutation alerting, no automatic retention-stage transitions,
+no scheduled 7-day warnings yet. See each module's doc comment.
+
+```
+cargo run -p sayfguard-daemon -- \
+  --state-dir ./sayfguard-state \
+  acquire \
+  --resource case-AC/registry --owner alice \
+  --registry /path/to/registry.db --objects /path/to/objects \
+  --sequester-root ./sequestered --passphrase-file ./passphrase.txt \
+  --backup-script /path/to/harvester-backup.py
+```
 
 ## Origin
 
