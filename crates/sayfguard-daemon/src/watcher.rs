@@ -97,7 +97,17 @@ pub fn run(
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = notify::recommended_watcher(tx)?;
     for watched in watches {
-        watcher.watch(&watched.path, RecursiveMode::NonRecursive)?;
+        // A guarded path that's a directory needs a recursive watch: content-
+        // addressed object stores nest files several levels deep (e.g.
+        // Combine Harvester's objects/objects/sha256/<prefix>/<hash>), and a
+        // non-recursive watch on the top directory only reports events on
+        // its immediate children, silently missing writes further down.
+        let mode = if watched.path.is_dir() {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        watcher.watch(&watched.path, mode)?;
     }
 
     loop {
@@ -141,10 +151,12 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retention::{DEFAULT_ATTESTED_GRACE_SECS, DEFAULT_FULL_FIDELITY_WINDOW_SECS};
     use crate::sequester::SequesterConfig;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -259,5 +271,51 @@ mod tests {
         };
 
         assert!(check_mutation(&watched, &store).unwrap().is_some());
+    }
+
+    #[test]
+    fn run_detects_a_write_nested_several_directories_deep_in_a_guarded_directory() {
+        use std::sync::mpsc;
+
+        let temp = TempDir::new().unwrap();
+        let store = LeaseStore::open(&temp.path().join("state")).unwrap();
+        let guarded_dir = temp.path().join("objects");
+        fs::create_dir_all(guarded_dir.join("objects/sha256/ab")).unwrap();
+        let watched = [WatchedPath {
+            resource: "case-AC/objects".to_string(),
+            path: guarded_dir.clone(),
+        }];
+
+        let (alert_tx, alert_rx) = mpsc::channel();
+        let run_thread = thread::spawn(move || {
+            let _ = run(
+                &watched,
+                &store,
+                &temp.path().join("sequester"),
+                DEFAULT_FULL_FIDELITY_WINDOW_SECS,
+                DEFAULT_ATTESTED_GRACE_SECS,
+                &AuditLog::open(&temp.path().join("audit.jsonl")),
+                Duration::from_secs(3600),
+                |alert| {
+                    let _ = alert_tx.send(alert.clone());
+                },
+                |_outcomes| {},
+            );
+        });
+
+        // Give the watcher a moment to install before writing, matching how
+        // a real deployment's watch process would already be running before
+        // any mutation happens.
+        thread::sleep(Duration::from_millis(300));
+        fs::write(guarded_dir.join("objects/sha256/ab/deadbeef"), b"blob").unwrap();
+
+        let alert = alert_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a write nested several directories deep must still be detected");
+        assert_eq!(alert.resource, "case-AC/objects");
+
+        // The watch loop blocks forever on a real deployment; this test
+        // doesn't join run_thread; the process ending at test exit is enough.
+        drop(run_thread);
     }
 }
