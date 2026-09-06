@@ -79,6 +79,13 @@ pub struct SequesteredArtifact {
     /// `RetentionStage::Degraded`; `None` while still full-fidelity.
     #[serde(default)]
     pub degraded_at: Option<u64>,
+    /// When `notify::run_notifications` (Phase 3) last delivered a
+    /// retention warning for this artifact; `None` if never notified.
+    /// `notify::is_due` counts the interval from this, falling back to
+    /// `sequestered_at`, so the cadence is "every N days from
+    /// sequestration" rather than "every N days from the first warning".
+    #[serde(default)]
+    pub last_notified_at: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -149,6 +156,7 @@ pub fn sequester(config: &SequesterConfig) -> Result<SequesteredArtifact, Seques
         task_complete: false,
         stage: RetentionStage::default(),
         degraded_at: None,
+        last_notified_at: None,
     };
     fs::write(&manifest_path, serde_json::to_string_pretty(&artifact)?)?;
     Ok(artifact)

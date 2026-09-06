@@ -3,21 +3,26 @@
 //! Phase 1 (see the technical directive's deployment-phasing table): lease
 //! and sequester modules, driven manually from this CLI. Phase 2 adds
 //! `watcher.rs` (lease-less-mutation alerting) and the full-fidelity ->
-//! degraded transition in `retention.rs`, both reachable below via `watch`,
-//! `sweep`, and `complete`. `notify.rs` (Phase 3: scheduled 7-day
-//! notifications, degraded -> attested) remains a scaffold. The
-//! architecture, retention policy, and GDPR posture are specified in
+//! degraded transition in `retention.rs`, reachable via `watch`, `sweep`,
+//! and `complete`. Phase 3 adds `notify.rs` (scheduled 7-day warnings, via
+//! `notify`), the degraded -> attested transition (folded into `sweep`),
+//! and `audit.rs` (a hash-chained trail for every lease grant and stage
+//! transition, inspectable via `audit-verify`). The architecture, retention
+//! policy, and GDPR posture are specified in
 //! `docs/SAYFGUARD_TECHNICAL_DIRECTIVE.md` and `docs/ADR/`.
 
+mod audit;
 mod lease;
 mod notify;
 mod retention;
 mod sequester;
 mod watcher;
 
+use audit::AuditLog;
 use clap::{Parser, Subcommand};
 use lease::LeaseStore;
-use retention::DEFAULT_FULL_FIDELITY_WINDOW_SECS;
+use notify::{HttpNotifier, LogNotifier, Notifier, RetryPolicy};
+use retention::{DEFAULT_ATTESTED_GRACE_SECS, DEFAULT_FULL_FIDELITY_WINDOW_SECS};
 use sequester::SequesterConfig;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -28,12 +33,21 @@ use watcher::WatchedPath;
 #[command(
     name = "sayfguard",
     version,
-    about = "Lease-gated evidence sequestration, lease-less-mutation alerting, and tiered retention"
+    about = "Lease-gated evidence sequestration, lease-less-mutation alerting, tiered retention, and retention-warning delivery"
 )]
 struct Cli {
     /// Directory holding Sayfguard's lease state (leases.json).
     #[arg(long, global = true, default_value = "./sayfguard-state")]
     state_dir: PathBuf,
+
+    /// Path to Sayfguard's hash-chained audit log (ADR-002: every lease
+    /// grant and retention-stage transition is recorded here). Defaults to
+    /// `<state-dir>/audit.jsonl` -- deliberately derived from `--state-dir`
+    /// rather than given its own independent literal default, so overriding
+    /// `--state-dir` alone can't silently leave the audit log behind in the
+    /// old location.
+    #[arg(long, global = true)]
+    audit_log: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -93,17 +107,22 @@ enum Command {
         sequester_root: PathBuf,
         #[arg(long, default_value_t = DEFAULT_FULL_FIDELITY_WINDOW_SECS)]
         window_seconds: u64,
+        #[arg(long, default_value_t = DEFAULT_ATTESTED_GRACE_SECS)]
+        attest_grace_seconds: u64,
         #[arg(long, default_value_t = 60)]
         sweep_interval_seconds: u64,
     },
-    /// Run a retention sweep now: degrades any full-fidelity artifact under
-    /// `--sequester-root` that has hit the window or been marked complete
-    /// (ADR-002's stage 1 -> stage 2 transition).
+    /// Run a retention sweep now: degrades any due full-fidelity artifact
+    /// under `--sequester-root` (ADR-002 stage 1 -> 2) and attests any
+    /// degraded artifact past its grace period (stage 2 -> 3, which purges
+    /// its manifest -- only the audit-log entry survives).
     Sweep {
         #[arg(long)]
         sequester_root: PathBuf,
         #[arg(long, default_value_t = DEFAULT_FULL_FIDELITY_WINDOW_SECS)]
         window_seconds: u64,
+        #[arg(long, default_value_t = DEFAULT_ATTESTED_GRACE_SECS)]
+        attest_grace_seconds: u64,
     },
     /// Mark every sequestered artifact for a resource as task-complete, so
     /// the next sweep degrades them regardless of age (ADR-002:
@@ -114,6 +133,28 @@ enum Command {
         #[arg(long)]
         sequester_root: PathBuf,
     },
+    /// Deliver a retention warning for every full-fidelity artifact due one
+    /// (ADR-002's 7-day cadence, counted from sequestration or the last
+    /// warning). Delivers to `--webhook-url` if given (HMAC-signed with
+    /// `--secret-file` if that's also given), otherwise logs the warning to
+    /// stderr.
+    Notify {
+        #[arg(long)]
+        sequester_root: PathBuf,
+        #[arg(long, default_value_t = notify::DEFAULT_NOTIFICATION_INTERVAL_SECS)]
+        interval_seconds: u64,
+        #[arg(long)]
+        webhook_url: Option<String>,
+        /// File containing the HMAC secret used to sign delivered payloads.
+        /// Ignored (with a warning) if `--webhook-url` isn't also set.
+        #[arg(long)]
+        secret_file: Option<PathBuf>,
+        #[arg(long, default_value_t = 200)]
+        min_interval_between_sends_ms: u64,
+    },
+    /// Verify Sayfguard's hash-chained audit log hasn't been tampered with,
+    /// mirroring Combine Harvester's own `verify_audit_chain`.
+    AuditVerify,
 }
 
 fn parse_watched_path(raw: &str) -> Result<WatchedPath, String> {
@@ -142,6 +183,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let audit_log_path = cli
+        .audit_log
+        .clone()
+        .unwrap_or_else(|| cli.state_dir.join("audit.jsonl"));
+    let audit_log = AuditLog::open(&audit_log_path);
 
     let outcome = match cli.command {
         Command::Acquire {
@@ -167,7 +213,7 @@ fn main() -> ExitCode {
                 resource: resource.clone(),
             };
             store
-                .acquire(&resource, &owner, Duration::from_secs(ttl_seconds), &config)
+                .acquire(&resource, &owner, Duration::from_secs(ttl_seconds), &config, &audit_log)
                 .map(|lease| print_json(&lease))
                 .map_err(|error| error.to_string())
         }
@@ -183,12 +229,15 @@ fn main() -> ExitCode {
             guards,
             sequester_root,
             window_seconds,
+            attest_grace_seconds,
             sweep_interval_seconds,
         } => watcher::run(
             &guards,
             &store,
             &sequester_root,
             window_seconds,
+            attest_grace_seconds,
+            &audit_log,
             Duration::from_secs(sweep_interval_seconds),
             |alert| {
                 eprintln!(
@@ -199,9 +248,9 @@ fn main() -> ExitCode {
                 );
             },
             |outcomes| {
-                let degraded: Vec<_> = outcomes.iter().filter(|o| o.transitioned).collect();
-                if !degraded.is_empty() {
-                    eprintln!("sayfguard: retention sweep degraded {} artifact(s)", degraded.len());
+                let transitioned: Vec<_> = outcomes.iter().filter(|o| o.transitioned).collect();
+                if !transitioned.is_empty() {
+                    eprintln!("sayfguard: retention sweep transitioned {} artifact(s)", transitioned.len());
                 }
             },
         )
@@ -209,7 +258,8 @@ fn main() -> ExitCode {
         Command::Sweep {
             sequester_root,
             window_seconds,
-        } => retention::sweep(&sequester_root, window_seconds)
+            attest_grace_seconds,
+        } => retention::sweep(&sequester_root, window_seconds, attest_grace_seconds, &audit_log)
             .map(|outcomes| print_json(&outcomes))
             .map_err(|error| error.to_string()),
         Command::Complete {
@@ -217,6 +267,48 @@ fn main() -> ExitCode {
             sequester_root,
         } => retention::mark_task_complete(&sequester_root, &resource)
             .map(|updated| println!("marked {updated} artifact(s) task-complete for '{resource}'"))
+            .map_err(|error| error.to_string()),
+        Command::Notify {
+            sequester_root,
+            interval_seconds,
+            webhook_url,
+            secret_file,
+            min_interval_between_sends_ms,
+        } => {
+            if secret_file.is_some() && webhook_url.is_none() {
+                eprintln!("sayfguard: --secret-file has no effect without --webhook-url; ignoring it");
+            }
+            let secret = match &webhook_url {
+                Some(_) => match secret_file {
+                    Some(path) => match std::fs::read_to_string(&path) {
+                        Ok(contents) => Some(contents.trim().to_string()),
+                        Err(error) => {
+                            eprintln!("sayfguard: failed to read secret file {}: {error}", path.display());
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    None => None,
+                },
+                None => None,
+            };
+            let notifier: Box<dyn Notifier> = match &webhook_url {
+                Some(url) => Box::new(HttpNotifier { url: url.clone() }),
+                None => Box::new(LogNotifier),
+            };
+            notify::run_notifications(
+                &sequester_root,
+                interval_seconds,
+                secret.as_deref(),
+                notifier.as_ref(),
+                &RetryPolicy::default(),
+                Duration::from_millis(min_interval_between_sends_ms),
+            )
+            .map(|outcomes| print_json(&outcomes))
+            .map_err(|error| error.to_string())
+        }
+        Command::AuditVerify => audit_log
+            .verify()
+            .map(|verification| print_json(&verification))
             .map_err(|error| error.to_string()),
     };
 

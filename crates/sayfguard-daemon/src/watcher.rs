@@ -16,6 +16,7 @@
 //! `sweep_interval`, not on a separate schedule -- Phase 3 is where a real
 //! cron-style scheduler for *notifications* is planned).
 
+use crate::audit::AuditLog;
 use crate::lease::{LeaseError, LeaseStore};
 use crate::retention::{self, RetentionError};
 use serde::Serialize;
@@ -79,11 +80,14 @@ pub fn check_mutation(
 /// `sequester_root` instead and reports its outcomes to `on_sweep`. Returns
 /// only on a fatal setup or channel error -- this is meant to run for the
 /// life of the process (e.g. under a supervisor), not to be polled.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     watches: &[WatchedPath],
     lease_store: &LeaseStore,
     sequester_root: &std::path::Path,
-    retention_window_secs: u64,
+    degrade_window_secs: u64,
+    attest_grace_secs: u64,
+    audit_log: &AuditLog,
     sweep_interval: Duration,
     mut on_alert: impl FnMut(&IntegrityAlert),
     mut on_sweep: impl FnMut(&[retention::SweepOutcome]),
@@ -112,7 +116,12 @@ pub fn run(
             }
             Ok(Err(_watch_error)) => continue,
             Err(RecvTimeoutError::Timeout) => {
-                let outcomes = retention::sweep(sequester_root, retention_window_secs)?;
+                let outcomes = retention::sweep(
+                    sequester_root,
+                    degrade_window_secs,
+                    attest_grace_secs,
+                    audit_log,
+                )?;
                 if !outcomes.is_empty() {
                     on_sweep(&outcomes);
                 }
@@ -185,17 +194,23 @@ mod tests {
         assert_eq!(alert.path, watched.path);
     }
 
+    fn audit_log(temp: &TempDir) -> AuditLog {
+        AuditLog::open(&temp.path().join("audit.jsonl"))
+    }
+
     #[test]
     fn does_not_alert_while_an_unexpired_lease_is_held() {
         let temp = TempDir::new().unwrap();
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let config = sequester_config(&temp, "case-AC/registry");
+        let log = audit_log(&temp);
         store
             .acquire(
                 "case-AC/registry",
                 "operator-1",
                 Duration::from_secs(900),
                 &config,
+                &log,
             )
             .unwrap();
         let watched = WatchedPath {
@@ -211,8 +226,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let config = sequester_config(&temp, "case-AC/registry");
+        let log = audit_log(&temp);
         store
-            .acquire("case-AC/registry", "operator-1", Duration::from_secs(0), &config)
+            .acquire("case-AC/registry", "operator-1", Duration::from_secs(0), &config, &log)
             .unwrap();
         let watched = WatchedPath {
             resource: "case-AC/registry".to_string(),
@@ -227,12 +243,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let config = sequester_config(&temp, "case-XY/registry");
+        let log = audit_log(&temp);
         store
             .acquire(
                 "case-XY/registry",
                 "operator-1",
                 Duration::from_secs(900),
                 &config,
+                &log,
             )
             .unwrap();
         let watched = WatchedPath {

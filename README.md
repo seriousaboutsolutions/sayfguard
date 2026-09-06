@@ -16,8 +16,8 @@ Read the full specification before implementing anything:
 
 ## Status
 
-Phases 1 and 2 of the deployment-phasing table (technical directive) are
-implemented.
+All three of the technical directive's daemon-logic phases (1-3) are
+implemented; only Phase 4 (Combine Harvester-specific integration) remains.
 
 **Phase 1** — `lease.rs` and `sequester.rs` are real, tested, and wired into
 a CLI. Acquiring a lease synchronously sequesters the guarded resource by
@@ -33,11 +33,20 @@ transition: `sayfguard sweep` degrades any full-fidelity artifact that has
 hit the retention window or been marked complete via `sayfguard complete`,
 deleting the encrypted archive bytes while keeping the manifest.
 
+**Phase 3** — `retention.rs` also now performs stage 2 -> 3 (degraded ->
+attested): once past the grace period, `sweep` deletes the manifest itself,
+leaving only a hash-chained entry in `audit.rs`'s tamper-evident log
+(`sayfguard audit-verify` checks it, mirroring Combine Harvester's own
+`verify_audit_chain`). Every lease grant is chained into that same log.
+`notify.rs` delivers a retention warning for every full-fidelity artifact
+due one (`sayfguard notify`) -- HMAC-signed and retried with backoff if a
+`--webhook-url` is configured, logged to stderr otherwise, since not every
+deployment has an addressable owner to send to.
+
 There is still no resident daemon process managing all of this together —
 `watch` is one long-running CLI invocation an operator or supervisor (e.g. a
-systemd service) starts explicitly. `notify.rs` (Phase 3: scheduled 7-day
-warnings, degraded -> attested transition, hash-chained audit trail) remains
-a scaffold.
+systemd service) starts explicitly, and `sweep`/`notify` are meant to be run
+periodically (cron, a systemd timer) rather than continuously.
 
 ```
 cargo run -p sayfguard-daemon -- \
@@ -56,6 +65,12 @@ cargo run -p sayfguard-daemon -- \
 
 # Periodically (e.g. from cron or a systemd timer):
 cargo run -p sayfguard-daemon -- sweep --sequester-root ./sequestered
+cargo run -p sayfguard-daemon -- notify --sequester-root ./sequestered \
+  --webhook-url https://example.org/sayfguard-warnings \
+  --secret-file ./webhook-secret.txt
+
+# Check the audit trail hasn't been tampered with:
+cargo run -p sayfguard-daemon -- --state-dir ./sayfguard-state audit-verify
 ```
 
 ## Origin

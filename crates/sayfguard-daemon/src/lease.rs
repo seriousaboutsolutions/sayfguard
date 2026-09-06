@@ -18,6 +18,7 @@
 //! at a time. Making this safe for a resident daemon handling concurrent
 //! requests is Phase 4 scope.
 
+use crate::audit::AuditLog;
 use crate::sequester::{self, SequesterConfig, SequesterError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -65,6 +66,8 @@ pub enum LeaseError {
     Corrupt(#[from] serde_json::Error),
     #[error("no lease on resource '{0}' is held by owner '{1}'")]
     NotHeld(String, String),
+    #[error("lease was granted but could not be recorded in the audit trail: {0}")]
+    Audit(#[from] crate::audit::AuditError),
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -115,12 +118,22 @@ impl LeaseStore {
     /// rejected outright; re-acquiring your own still-valid lease re-runs
     /// sequestration and refreshes the TTL rather than erroring, since a
     /// caller renewing its own lease is not a conflict.
+    ///
+    /// Per ADR-002, every grant is chained into `audit_log`. That append
+    /// happens after the lease is already saved to `leases.json`: if it
+    /// fails, the caller sees `LeaseError::Audit` even though the lease
+    /// itself was granted successfully -- a real gap for a case as
+    /// exceptional as the audit log's own storage failing, not silently
+    /// swallowed. Rolling back an already-persisted lease to keep this
+    /// perfectly atomic isn't attempted; Phase 1-2's single-writer-at-a-time
+    /// assumption already accepts a comparable, narrower window.
     pub fn acquire(
         &self,
         resource: &str,
         owner: &str,
         ttl: Duration,
         sequester_config: &SequesterConfig,
+        audit_log: &AuditLog,
     ) -> Result<Lease, LeaseError> {
         let now = now_unix();
         let mut state = self.load()?;
@@ -146,6 +159,11 @@ impl LeaseStore {
         };
         state.leases.insert(resource.to_string(), lease.clone());
         self.save(&state)?;
+        audit_log.append(
+            Some(resource),
+            "lease_granted",
+            Some(&format!("owner={owner} sha256={}", lease.sequestered_artifact_sha256)),
+        )?;
         Ok(lease)
     }
 
@@ -221,14 +239,19 @@ mod tests {
         }
     }
 
+    fn audit_log(temp: &TempDir) -> AuditLog {
+        AuditLog::open(&temp.path().join("audit.jsonl"))
+    }
+
     #[test]
     fn grants_a_lease_and_records_the_sequestered_artifact() {
         let temp = TempDir::new().unwrap();
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let config = sequester_config(&temp, "case-AC");
+        let log = audit_log(&temp);
 
         let lease = store
-            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config)
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config, &log)
             .unwrap();
 
         assert_eq!(lease.owner, "operator-1");
@@ -236,16 +259,34 @@ mod tests {
     }
 
     #[test]
+    fn grants_are_chained_into_the_audit_log() {
+        let temp = TempDir::new().unwrap();
+        let store = LeaseStore::open(&temp.path().join("state")).unwrap();
+        let config = sequester_config(&temp, "case-AC");
+        let log = audit_log(&temp);
+
+        store
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config, &log)
+            .unwrap();
+
+        let events = log.read_all().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, "lease_granted");
+        assert_eq!(events[0].resource.as_deref(), Some("case-AC/registry.db"));
+    }
+
+    #[test]
     fn rejects_a_conflicting_acquire_by_a_different_owner() {
         let temp = TempDir::new().unwrap();
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let config = sequester_config(&temp, "case-AC");
+        let log = audit_log(&temp);
 
         store
-            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config)
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config, &log)
             .unwrap();
         let error = store
-            .acquire("case-AC/registry.db", "operator-2", Duration::from_secs(900), &config)
+            .acquire("case-AC/registry.db", "operator-2", Duration::from_secs(900), &config, &log)
             .unwrap_err();
 
         assert!(matches!(error, LeaseError::AlreadyHeld { .. }));
@@ -256,12 +297,13 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let config = sequester_config(&temp, "case-AC");
+        let log = audit_log(&temp);
 
         let first = store
-            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config)
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config, &log)
             .unwrap();
         let second = store
-            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config)
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config, &log)
             .unwrap();
 
         assert_eq!(first.owner, second.owner);
@@ -273,9 +315,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let config = sequester_config(&temp, "case-AC");
+        let log = audit_log(&temp);
 
         store
-            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(0), &config)
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(0), &config, &log)
             .unwrap();
         // ttl_seconds = 0 means the lease is already expired as of the next
         // call to now_unix(), so a different owner should be able to acquire.
@@ -284,6 +327,7 @@ mod tests {
             "operator-2",
             Duration::from_secs(900),
             &config,
+            &log,
         );
 
         assert!(second.is_ok());
@@ -295,13 +339,15 @@ mod tests {
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let mut config = sequester_config(&temp, "case-AC");
         config.python = PathBuf::from("no-such-interpreter-binary");
+        let log = audit_log(&temp);
 
         let error = store
-            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config)
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config, &log)
             .unwrap_err();
 
         assert!(matches!(error, LeaseError::Sequester(_)));
         assert!(store.active_leases().unwrap().is_empty());
+        assert!(log.read_all().unwrap().is_empty());
     }
 
     #[test]
@@ -309,8 +355,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let config = sequester_config(&temp, "case-AC");
+        let log = audit_log(&temp);
         store
-            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config)
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config, &log)
             .unwrap();
 
         store.release("case-AC/registry.db", "operator-1").unwrap();
@@ -323,8 +370,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let config = sequester_config(&temp, "case-AC");
+        let log = audit_log(&temp);
         store
-            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config)
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config, &log)
             .unwrap();
 
         let error = store.release("case-AC/registry.db", "operator-2").unwrap_err();
@@ -337,8 +385,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = LeaseStore::open(&temp.path().join("state")).unwrap();
         let config = sequester_config(&temp, "case-AC");
+        let log = audit_log(&temp);
         store
-            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(0), &config)
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(0), &config, &log)
             .unwrap();
 
         assert!(store.active_leases().unwrap().is_empty());
@@ -349,9 +398,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let state_dir = temp.path().join("state");
         let config = sequester_config(&temp, "case-AC");
+        let log = audit_log(&temp);
         LeaseStore::open(&state_dir)
             .unwrap()
-            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config)
+            .acquire("case-AC/registry.db", "operator-1", Duration::from_secs(900), &config, &log)
             .unwrap();
 
         let reopened = LeaseStore::open(&state_dir).unwrap();
